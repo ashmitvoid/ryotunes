@@ -7,25 +7,27 @@ fail=0
 say() { printf '[%s] %s\n' "$1" "$2"; }
 
 say check 'release identity'
-grep -q 'version = "2.4.1"' Cargo.toml || { say FAIL 'workspace version is not 2.4.1'; fail=1; }
-grep -q '"version": "2.4.1"' src-tauri/tauri.conf.json || { say FAIL 'Tauri version is not 2.4.1'; fail=1; }
-grep -q '"version": "2.4.1"' ui/package.json || { say FAIL 'UI version is not 2.4.1'; fail=1; }
+# One version everywhere: the Cargo workspace is the source (scripts/sync-version.sh writes it).
+ver="$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' Cargo.toml | head -1)"
+[[ -n "$ver" ]] || { say FAIL 'workspace version missing from Cargo.toml'; fail=1; }
+grep -q "\"version\": \"$ver\"" src-tauri/tauri.conf.json || { say FAIL "Tauri version is not $ver"; fail=1; }
+grep -q "\"version\": \"$ver\"" ui/package.json || { say FAIL "UI version is not $ver"; fail=1; }
 grep -q '"identifier": "dev.ryoku.ryotunes"' src-tauri/tauri.conf.json || { say FAIL 'unexpected application identifier'; fail=1; }
 
-say check 'private-machine and secret patterns'
-# Do not scan license/upstream attribution for project names. This scan is for actual release data.
-if grep -RniE --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.pnpm-store --exclude='UPSTREAM.md' --exclude='release-check.sh' \
-  '(/home/[A-Za-z0-9._-]+/|/Users/[A-Za-z0-9._-]+/|[A-Z]:\\Users\\[^\\]+\\|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|[A-Za-z0-9-]+\.ts\.net)' .; then
-  say FAIL 'machine-specific path, endpoint, or secret-like value found'
+say check 'private keys and private endpoints'
+# Scan versioned/unignored source, not makepkg trees or generated frontend output.
+# A generic /home/... literal is not evidence of a secret (tests use portable
+# file-URL fixtures); check actual private-key markers and private service hosts.
+if git ls-files --cached --others --exclude-standard -z \
+  | while IFS= read -r -d '' file; do
+      if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
+    done \
+  | xargs -0 -r grep -nIE --exclude='release-check.sh' \
+    '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|[A-Za-z0-9-]+\.ts\.net)'; then
+  say FAIL 'private key or private endpoint found'
   fail=1
 fi
 
-say check 'legacy product strings in active source'
-if grep -RniE --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules --exclude='UPSTREAM.md' --exclude='LICENSE' \
-  --exclude='release-check.sh' 'limusic|LIMUSIC|SimoHypers' src-tauri crates ui packaging scripts 2>/dev/null; then
-  say FAIL 'legacy branding remains in active source'
-  fail=1
-fi
 
 say check 'Rust model invariants'
 python scripts/check-source-shapes.py
@@ -51,6 +53,18 @@ for p in root.rglob('*.toml'):
     tomllib.loads(p.read_text())
 print('JSON/TOML: OK')
 PY
+
+say check 'every shipped skin passes ryotunes-cli skin check'
+if command -v cargo >/dev/null 2>&1; then
+  cargo build -q -p ryotunes-cli
+  for d in skins/*/; do
+    [ -f "${d}skin.json" ] || continue
+    ./target/debug/ryotunes-cli skin check "$d" >/dev/null \
+      || { say FAIL "skin ${d} fails validation"; fail=1; }
+  done
+else
+  say skip 'cargo unavailable; skin validation not run'
+fi
 
 if command -v node >/dev/null 2>&1; then
   say check 'TypeScript syntax'

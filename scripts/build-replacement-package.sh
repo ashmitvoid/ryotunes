@@ -6,7 +6,7 @@ OUT="${1:-$ROOT/dist}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
-VERSION="2.4.1"
+VERSION="$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' "$(dirname "$0")/../Cargo.toml" | head -1)"
 PKGREL="1"
 PKGNAME="ryotunes-v2.4"
 BINNAME="ryotunes-v2.4"
@@ -157,7 +157,7 @@ Target = usr/bin/ryotunes
 Target = usr/share/applications/ryotunes.desktop
 
 [Action]
-Description = Re-activating Ryotunes v2.4 after a Ryoku package update
+Description = Re-activating Ryotunes v2 after a Ryoku package update
 When = PostTransaction
 Exec = /usr/lib/ryotunes-v2.4/activate-replacement
 HOOK
@@ -180,14 +180,14 @@ INSTALL
 
 cat > "$PKGWORK/PKGBUILD" <<'PKG'
 pkgname=ryotunes-v2.4
-pkgver=2.4.1
+pkgver=$VERSION
 pkgrel=1
-pkgdesc='Ryotunes v2.4 - Ryoku replacement Linux desktop music client'
+pkgdesc='Ryotunes v2 - Ryoku replacement Linux desktop music client'
 arch=('x86_64')
 url='https://github.com/ashmitvoid/RYOTUNES'
 license=('GPL-3.0-or-later')
 depends=('webkit2gtk-4.1' 'libappindicator-gtk3' 'mpv' 'openssl' 'librsvg' 'desktop-file-utils' 'hicolor-icon-theme' 'xdg-utils')
-provides=('ryotunes=2.4.1')
+provides=('ryotunes=$VERSION')
 conflicts=('ryotunes-v2.3' 'ryotunes-v2.2' 'ryotunes-v2.1' 'ryotunes-v2.0')
 install='ryotunes-v2.4.install'
 source=('ryotunes-v2.4' 'ryotunes' 'ryotunes-v2.4-sync' 'ryotunes.desktop' 'activate-replacement' 'deactivate-replacement' '99-ryotunes-v2.4-replacement.hook' 'ryotunes-v2.4.install' 'LICENSE' 'README.md' 'RELEASE_NOTES.md' 'UPSTREAM.md' 'RyotunesBarWidget.qml' 'QUICKSHELL_README.md' 'icon32.png' 'icon64.png' 'icon128.png' 'icon256.png' 'icon512.png' 'ryotunes-window-rule.lua')
@@ -235,7 +235,7 @@ FINAL_PKG="$OUT/$(basename "$PKGFILE")"
 PAYLOAD_DIR="$WORK/payload"
 mkdir -p "$PAYLOAD_DIR"
 bsdtar -xf "$FINAL_PKG" -C "$PAYLOAD_DIR" usr
-tar --zstd -C "$PAYLOAD_DIR" -cf "$OUT/ryotunes-v2.4.1-linux-x86_64.tar.zst" usr
+tar --zstd -C "$PAYLOAD_DIR" -cf "$OUT/ryotunes-v$VERSION-linux-x86_64.tar.zst" usr
 
 # One-click-ish end-user folder. install.sh keeps old custom packages out of the way and reasserts
 # v2.4 after their uninstall hooks restore stock.
@@ -247,8 +247,8 @@ cat > "$BUNDLE/install.sh" <<'BINSTALL'
 #!/usr/bin/env bash
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PKG="$(find "$HERE" -maxdepth 1 -name 'ryotunes-v2.4-2.4.1-1-x86_64.pkg.tar.zst' -print -quit)"
-[[ -n "$PKG" ]] || { echo "Ryotunes v2.4 package not found beside install.sh" >&2; exit 1; }
+PKG="$(find "$HERE" -maxdepth 1 -name 'ryotunes-v2.4-$VERSION-1-x86_64.pkg.tar.zst' -print -quit)"
+[[ -n "$PKG" ]] || { echo "Ryotunes v2 package not found beside install.sh" >&2; exit 1; }
 
 sudo pacman -U --needed "$PKG"
 for old in ryotunes-v2.3 ryotunes-v2.2 ryotunes-v2.1 ryotunes-v2.0 ryotunes-v20 ryotunes-v21 ryotunes-v22 ryotunes-v23 ryotunes-v24 ryotunes-v1.4 ryotunes-v1.5 ryotunes-v1.6 ryotunes-v1.7 ryotunes-v1.8 ryotunes-v1.9; do
@@ -259,7 +259,7 @@ done
 sudo /usr/lib/ryotunes-v2.4/activate-replacement
 "$HERE/ryoku-window-rule.sh" install
 command -v update-desktop-database >/dev/null 2>&1 && sudo update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
-echo "Ryotunes v2.4 installed. Launch it with: ryotunes"
+echo "Ryotunes v2 installed. Launch it with: ryotunes"
 BINSTALL
 chmod 755 "$BUNDLE/install.sh" "$BUNDLE/ryoku-window-rule.sh"
 
@@ -273,13 +273,13 @@ BUNINSTALL
 chmod 755 "$BUNDLE/uninstall.sh"
 
 cat > "$BUNDLE/README.txt" <<'BREADME'
-Ryotunes v2.4 for Ryoku / CachyOS / Arch x86_64
+Ryotunes v2 for Ryoku / CachyOS / Arch x86_64
 
 Recommended:
   ./install.sh
 
 Manual package install:
-  sudo pacman -U ./ryotunes-v2.4-2.4.1-1-x86_64.pkg.tar.zst
+  sudo pacman -U ./ryotunes-v2.4-$VERSION-1-x86_64.pkg.tar.zst
 
 The installer keeps ryoku-desktop installed and replaces only the stock Ryotunes entry points.
 BREADME
@@ -292,8 +292,8 @@ BREADME
 
 (
   cd "$OUT"
-  sha256sum     "$(basename "$FINAL_PKG")"     ryotunes-v2.4.1-linux-x86_64.tar.zst     Ryotunes-v2.4-Ryoku-x86_64.zip     > SHA256SUMS-v2.4.1.txt
+  sha256sum     "$(basename "$FINAL_PKG")"     ryotunes-v$VERSION-linux-x86_64.tar.zst     Ryotunes-v2.4-Ryoku-x86_64.zip     > SHA256SUMS-v$VERSION.txt
 )
 
 echo "release assets written to $OUT"
-cat "$OUT/SHA256SUMS-v2.4.1.txt"
+cat "$OUT/SHA256SUMS-v$VERSION.txt"

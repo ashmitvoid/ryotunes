@@ -8,6 +8,7 @@
 	import { appearance } from '$lib/theme.svelte';
 	import { ryokuWheelScroll } from '$lib/ryoku-scroll';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
+	import { t } from '$lib/i18n.svelte';
 	import { RefreshIcon, MusicNote01Icon } from '@hugeicons/core-free-icons';
 
 	// `expanded` only sizes the type and centres the column. The owner of the extra room (the side
@@ -60,12 +61,15 @@
 
 	// videoId of the fetch whose result is (or will be) shown — guards stale responses.
 	let requested = '';
+	let refreshQueued = false;
+	let refreshRunning = false;
 
 	async function requestLyrics(force = false) {
 		const now = playback.now;
 		if (!now) {
 			requested = '';
 			lyrics = null;
+			refreshQueued = false;
 			loading = false;
 			return;
 		}
@@ -89,13 +93,51 @@
 			if (requested !== id) return;
 			lyrics = null;
 		} finally {
-			if (requested === id) loading = false;
+			if (requested === id) {
+				loading = false;
+				if (refreshQueued) void refreshInPlace();
+			}
 		}
 	}
 
 	$effect(() => {
 		playback.now?.videoId;
 		void requestLyrics();
+	});
+
+	// Same track, new reading (the romanize setting flipped): swap the lines in place, without the
+	// loading state or the scroll reset a track change brings.
+	async function refreshInPlace() {
+		const now = playback.now;
+		if (!now || now.videoId !== requested) {
+			refreshQueued = false;
+			return;
+		}
+		refreshQueued = true;
+		if (loading || refreshRunning) return;
+		refreshQueued = false;
+		refreshRunning = true;
+		const id = now.videoId;
+		const album = playback.queue.items[playback.queue.currentIndex]?.album;
+		try {
+			const l = await api.getLyrics({
+				videoId: id,
+				title: now.title,
+				artists: now.artists,
+				album: album ?? undefined,
+				duration: durationSecs(now.duration)
+			});
+			if (requested === id) lyrics = l;
+		} catch {
+		} finally {
+			refreshRunning = false;
+			if (refreshQueued) void refreshInPlace();
+		}
+	}
+
+	$effect(() => {
+		const unlisten = api.onLyricsChanged(() => void refreshInPlace());
+		return () => void unlisten.then((off) => off());
 	});
 
 	$effect(() => {
@@ -267,7 +309,7 @@
 			: 'px-5 py-6'}"
 >
 	{#if manualScroll && lyrics?.synced && activeIndex >= 0 && !compact}
-		<button type="button" class="ryo-lyrics-return" onclick={returnToCurrent}>CURRENT LINE</button>
+		<button type="button" class="ryo-lyrics-return" onclick={returnToCurrent}>{t('CURRENT LINE')}</button>
 	{/if}
 	{#if loading}
 		<div class="ryo-lyrics-resolving" aria-live="polite">
@@ -276,8 +318,8 @@
 				<b>LOCAL → PROVIDERS</b>
 			</div>
 			<div class="ryo-lyrics-resolving-meta">
-				<strong>{playback.now?.title ?? 'CURRENT TRACK'}</strong>
-				<small>{playback.now?.artists ?? 'Waiting for metadata'}</small>
+				<strong>{playback.now?.title ?? t('CURRENT TRACK')}</strong>
+				<small>{playback.now?.artists ?? t('Waiting for metadata')}</small>
 			</div>
 			<div class="ryo-lyrics-ruled" aria-hidden="true">
 				{#each { length: 7 } as _, i (i)}
@@ -290,8 +332,8 @@
 		<div class="ryo-lyrics-empty">
 			<div class="ryo-lyrics-empty-mark"><HugeiconsIcon icon={MusicNote01Icon} class="h-5 w-5" /></div>
 			<span>// LYRICS / INSTRUMENTAL</span>
-			<strong>Instrumental track.</strong>
-			<p>There are no vocal lines to follow for this recording.</p>
+			<strong>{t('Instrumental track.')}</strong>
+			<p>{t('There are no vocal lines to follow for this recording.')}</p>
 		</div>
 	{:else if lyrics && lyrics.synced}
 		
@@ -341,6 +383,11 @@
 					{/if}
 
 					
+					{#if line.romanized}
+						<p class="-mt-0.5 text-sm font-normal leading-snug opacity-70 transition-opacity">
+							{line.romanized}
+						</p>
+					{/if}
 					{#if line.translation}
 						<p class="mt-1 text-sm font-normal italic tracking-wide opacity-80 transition-opacity">
 							{line.translation}
@@ -361,6 +408,9 @@
 				{#if line.text}
 					<div>
 						<p>{line.text}</p>
+						{#if line.romanized}
+							<p class="-mt-0.5 text-xs leading-snug text-muted-foreground">{line.romanized}</p>
+						{/if}
 						{#if line.translation}
 							<p class="text-xs italic text-muted-foreground">{line.translation}</p>
 						{/if}
@@ -374,10 +424,10 @@
 		<div class="ryo-lyrics-empty">
 			<div class="ryo-lyrics-empty-mark">詞</div>
 			<span>// LYRICS / EMPTY</span>
-			<strong>No lyrics found for this track.</strong>
-			<p>{playback.now?.title ?? 'Current track'} · {playback.now?.artists ?? 'Unknown artist'}</p>
+			<strong>{t('No lyrics found for this track.')}</strong>
+			<p>{playback.now?.title ?? t('Current track')} · {playback.now?.artists ?? t('Unknown artist')}</p>
 			<div class="ryo-lyrics-empty-readout"><b>SOURCE</b><em>PROVIDER CHAIN</em><b>STATE</b><em>EMPTY</em></div>
-			<button type="button" onclick={() => requestLyrics(true)}><HugeiconsIcon icon={RefreshIcon} class="h-3.5 w-3.5" /> Retry lookup</button>
+			<button type="button" onclick={() => requestLyrics(true)}><HugeiconsIcon icon={RefreshIcon} class="h-3.5 w-3.5" /> {t('Retry lookup')}</button>
 		</div>
 	{/if}
 </div>
@@ -385,10 +435,10 @@
 	<div class="ryo-lyrics-footer flex items-center justify-between gap-3 border-t text-xs text-muted-foreground" style="background:var(--ryo-paper);color:var(--ryo-ink-muted);border-color:var(--ryo-line);">
 		<span>{lyrics.source.startsWith('Source:') ? lyrics.source : `Lyrics from ${lyrics.source}`}</span>
 		{#if lyrics.synced}
-			<div class="ryo-lyrics-timing flex items-center gap-1" title="Adjust lyric timing for this track">
-				<span class="mr-1 opacity-70">Timing {formatOffset(offsetMs)}</span>
+			<div class="ryo-lyrics-timing flex items-center gap-1" title={t('Adjust lyric timing for this track')}>
+				<span class="mr-1 opacity-70">{t('Timing')} {formatOffset(offsetMs)}</span>
 				<button type="button" class="rounded-md px-1.5 py-0.5 hover:bg-muted hover:text-foreground" onclick={() => setOffset(offsetMs - 500)}>−0.5</button>
-				<button type="button" class="rounded-md px-1.5 py-0.5 hover:bg-muted hover:text-foreground" onclick={() => setOffset(0)}>Reset</button>
+				<button type="button" class="rounded-md px-1.5 py-0.5 hover:bg-muted hover:text-foreground" onclick={() => setOffset(0)}>{t('Reset')}</button>
 				<button type="button" class="rounded-md px-1.5 py-0.5 hover:bg-muted hover:text-foreground" onclick={() => setOffset(offsetMs + 500)}>+0.5</button>
 			</div>
 		{/if}

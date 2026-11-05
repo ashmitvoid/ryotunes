@@ -380,10 +380,50 @@ export interface DiscordStatus { enabled: boolean; status: 'disabled' | 'connect
 export const discordStatus = () => invoke<DiscordStatus>('discord_status');
 /** Streamable client keys for the "disabled clients" setting. */
 export const getStreamClients = () => invoke<string[]>('get_stream_clients');
-/** Wipe both cache tiers (URL cache + mpv on-disk audio cache). */
-export const clearCaches = () => invoke<void>('clear_caches');
+/** Force-clear every playback cache; `rotate` (default true) also re-bootstraps the YouTube visitorData. */
+export const clearCaches = (rotate = true) =>
+	invoke<{ visitorDataRefreshed: boolean }>('clear_caches', { rotate });
 /** Open an http(s) link in the real browser, never in the webview itself. */
 export const openExternal = (url: string) => invoke<void>('open_external', { url });
+
+// --- updates (self-update; shared Rust updater) --------------------------------------------
+/**
+ * A version check against the project's GitHub releases. `latestVersion` is a bare semver
+ * (e.g. "1.0.1"), or null when no eligible release is published yet — that is not an error, only a
+ * network failure is. `available` is true when a newer eligible release exists; `canInstall` is
+ * true only where an in-app install is supported (a managed Arch/x86_64 package), with
+ * `unsupportedReason` explaining why not otherwise. `notes` is plain release text; `releaseUrl` is
+ * the changelog page.
+ */
+export interface UpdateInfo {
+	currentVersion: string;
+	latestVersion: string | null;
+	available: boolean;
+	releaseUrl: string;
+	notes: string;
+	canInstall: boolean;
+	unsupportedReason: string | null;
+}
+export const checkForUpdates = () => invoke<UpdateInfo>('check_for_updates');
+/**
+ * Download, verify and install the requested release. The backend rechecks it against the exact
+ * latest eligible version before fetching anything, installs only known release assets after a hash
+ * check, and needs administrator approval (pkexec). `restartRequired` is true when the whole app
+ * must be quit and reopened to reload the daemon and client. A network, hash or privilege failure
+ * is a real error.
+ */
+export interface UpdateInstallResult {
+	version: string;
+	restartRequired: boolean;
+}
+export const installUpdate = (version: string) =>
+	invoke<UpdateInstallResult>('install_update', { version });
+
+// --- personal store (Home Shortcuts, sidebar pins, play recency; see personal.ts) -------------
+/** The stored blob, wrapped as `{ personal }`; `personal` is `{}` when nothing is saved yet. */
+export const getPersonal = () => invoke<{ personal: unknown }>('get_personal');
+/** Replace the stored blob. The backend rejects a non-object or a blob over 1 MiB. */
+export const setPersonal = (personal: unknown) => invoke<void>('set_personal', { personal });
 
 // --- auth (authentication flow) ---------------------------------------------------------------------
 export const getAccount = () => invoke<Account>('get_account');
@@ -558,6 +598,9 @@ export const onPosition = (cb: (p: number) => void): Promise<UnlistenFn> =>
 	listen<{ position: number }>('position', (e) => cb(e.payload.position));
 export const onDuration = (cb: (d: number) => void): Promise<UnlistenFn> =>
 	listen<{ duration: number }>('duration', (e) => cb(e.payload.duration));
+/** A setting that shapes `get_lyrics` replies changed (romanization): refetch the open lyrics. */
+export const onLyricsChanged = (cb: () => void): Promise<UnlistenFn> =>
+	listen('lyrics-changed', () => cb());
 /** Echo of every `set_volume`, so a second window's slider can't drift from what you hear. */
 export const onVolume = (cb: (v: number) => void): Promise<UnlistenFn> =>
 	listen<number>('volume', (e) => cb(e.payload));
@@ -637,6 +680,8 @@ export interface LyricLine {
 	text: string;
 	words?: LyricWord[];
 	translation?: string;
+	/** Latin reading of `text`, present when the `lyrics_romanize` setting is on. */
+	romanized?: string;
 }
 export interface Lyrics {
 	/** Attribution for the panel footer ("LRCLIB", "Source: Musixmatch", …). */

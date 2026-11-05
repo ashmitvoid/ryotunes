@@ -7,13 +7,13 @@ use innertube::{
     AlbumPage, ArtistPage, BrowseItem, HomePage, PlaylistContinuation, PlaylistPage, PlaylistSort,
     Rating, SearchCardPage, SearchResult, SearchResults, SongItem,
 };
-use tauri::{Emitter, State};
+use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::state::{
     is_local_playlist_id, is_smart_playlist_id, AppState, LOCAL_PLAYLIST_PREFIX, ON_REPEAT_ID,
     ON_REPEAT_LIMIT, ON_REPEAT_WINDOW_SECS, RECENTLY_PLAYED_ID, RECENTLY_PLAYED_WINDOW_SECS,
-    REDISCOVER_ID, REDISCOVER_OLDER_THAN_SECS, SMART_PLAYLIST_LIMIT,
+    REDISCOVER_ID, REDISCOVER_OLDER_THAN_SECS, SMART_PLAYLIST_LIMIT, UI_SETTINGS,
 };
 
 type St<'a> = State<'a, Arc<AppState>>;
@@ -63,7 +63,7 @@ fn normalize_ui_setting(key: &str, raw: &str) -> Result<String, String> {
             .then(|| raw.to_owned())
             .ok_or_else(|| "Unknown audio quality.".into()),
         "enable_history" | "discord_rpc" | "close_to_tray" | "autostart" | "autoplay"
-        | "prevent_duplicates" | "lyrics_boidu" | "low_resource_mode" => {
+        | "prevent_duplicates" | "lyrics_boidu" | "lyrics_romanize" | "low_resource_mode" => {
             matches!(raw, "true" | "false")
                 .then(|| raw.to_owned())
                 .ok_or_else(|| format!("{key} must be true or false."))
@@ -124,30 +124,25 @@ fn canonical_music_folder(raw: &str) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn search(state: St<'_>, query: String) -> Result<Vec<SongItem>, String> {
-    let client = state.clients.get(innertube::METADATA_CLIENT).ok_or("metadata client missing")?;
-    let result = state.it.search_songs(client, &query).await.map_err(|e| e.to_string())?;
-    Ok(result.items)
+    state.search(&query).await
 }
 
 /// Songs-only first search page, including YouTube's opaque continuation token.
 #[tauri::command]
 pub async fn search_page(state: St<'_>, query: String) -> Result<SearchResult, String> {
-    let client = state.clients.get(innertube::METADATA_CLIENT).ok_or("metadata client missing")?;
-    state.it.search_songs(client, &query).await.map_err(|e| e.to_string())
+    state.search_page(&query).await
 }
 
 /// Continue a songs-only search page.
 #[tauri::command]
 pub async fn search_page_more(state: St<'_>, token: String) -> Result<SearchResult, String> {
-    let client = state.clients.get(innertube::METADATA_CLIENT).ok_or("metadata client missing")?;
-    state.it.search_songs_continuation(client, &token).await.map_err(|e| e.to_string())
+    state.search_page_more(&token).await
 }
 
 /// Unfiltered search → categorized sections for the search page.
 #[tauri::command]
 pub async fn search_all(state: St<'_>, query: String) -> Result<SearchResults, String> {
-    let client = metadata_client(&state)?;
-    state.it.search_all(client, &query).await.map_err(|e| e.to_string())
+    state.search_all(&query).await
 }
 
 /// Filtered "Show more" search for one category (albums / artists / playlists).
@@ -157,8 +152,7 @@ pub async fn search_cards(
     query: String,
     category: String,
 ) -> Result<Vec<BrowseItem>, String> {
-    let client = metadata_client(&state)?;
-    state.it.search_cards(client, &query, &category).await.map_err(|e| e.to_string())
+    state.search_cards(&query, &category).await
 }
 
 /// First filtered card page plus continuation.
@@ -168,22 +162,19 @@ pub async fn search_cards_page(
     query: String,
     category: String,
 ) -> Result<SearchCardPage, String> {
-    let client = metadata_client(&state)?;
-    state.it.search_cards_page(client, &query, &category).await.map_err(|e| e.to_string())
+    state.search_cards_page(&query, &category).await
 }
 
 /// Continue a filtered card search.
 #[tauri::command]
 pub async fn search_cards_more(state: St<'_>, token: String) -> Result<SearchCardPage, String> {
-    let client = metadata_client(&state)?;
-    state.it.search_cards_continuation(client, &token).await.map_err(|e| e.to_string())
+    state.search_cards_more(&token).await
 }
 
 /// Continue the mixed result stream if YouTube supplied one.
 #[tauri::command]
 pub async fn search_all_more(state: St<'_>, token: String) -> Result<SearchResults, String> {
-    let client = metadata_client(&state)?;
-    state.it.search_all_continuation(client, &token).await.map_err(|e| e.to_string())
+    state.search_all_more(&token).await
 }
 
 /// Play a track (from a search result). The UI passes the full item so we can seed the queue
@@ -323,30 +314,14 @@ pub async fn seek(state: St<'_>, position: f64) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn set_volume(state: St<'_>, volume: i64) -> Result<(), String> {
-    if !(0..=100).contains(&volume) {
-        return Err("Volume must be between 0 and 100.".into());
-    }
-    state.player.set_volume(volume).map_err(|e| e.to_string())?;
-    // There is one volume and there can be two windows (the mini player). Without this the one
-    // that didn't move the slider keeps showing the old level and lies about what you're hearing.
-    let _ = state.app.emit("volume", volume);
-    Ok(())
+    state.set_volume(volume)
 }
 
 /// Tempo (0.25–2.0) and pitch (−12..=12 semitones), the "Advanced" dialog. Volatile by design:
 /// both reset to 1.0 / 0 on restart, so nobody wonders next week why everything sounds wrong.
 #[tauri::command]
 pub async fn set_playback_params(state: St<'_>, speed: f64, semitones: i32) -> Result<(), String> {
-    if !speed.is_finite() || !(0.25..=2.0).contains(&speed) {
-        return Err("Tempo must be between 0.25× and 2.00×.".into());
-    }
-    if !(-12..=12).contains(&semitones) {
-        return Err("Pitch must be between -12 and +12 semitones.".into());
-    }
-    // Pitch first: it's the one that can fail (no librubberband), and it rolls itself back, so a
-    // failure leaves nothing applied and the UI can revert both steppers together.
-    state.player.set_pitch(semitones).map_err(|e| e.to_string())?;
-    state.player.set_speed(speed).map_err(|e| e.to_string())
+    state.set_playback_params(speed, semitones)
 }
 
 #[tauri::command]
@@ -354,50 +329,35 @@ pub async fn get_queue(state: St<'_>) -> Result<serde_json::Value, String> {
     Ok(state.queue_snapshot().await)
 }
 
-/// Settings the UI is allowed to read *and write*. Session/auth material (`session_cookie`,
-/// `selected_identity_json`, `data_sync_id`, `account_json`, `account_selection_pending`,
-/// `visitor_data`) and internal blobs (`queue_json`, `queue_index`, `queue_position`) never cross
-/// into the webview: they'd otherwise ship the login credential to the renderer on every open, and
-/// the webview can't overwrite them either.
-const UI_SETTINGS: [&str; 14] = [
-    "volume",
-    "proxy",
-    "quality",
-    "enable_history",
-    "disabled_stream_clients",
-    "discord_rpc",
-    "discord_presence_name",
-    "close_to_tray",
-    "autostart",
-    "autoplay",
-    "prevent_duplicates",
-    "lyrics_boidu",
-    "ui_scale",
-    "low_resource_mode",
-];
+#[tauri::command]
+pub async fn check_for_updates() -> Result<ryotunes_core::update::UpdateInfo, String> {
+    ryotunes_core::update::check_for_updates().await
+}
+
+#[tauri::command]
+pub async fn install_update(
+    version: String,
+) -> Result<ryotunes_core::update::InstalledUpdate, String> {
+    ryotunes_core::update::install_update(version).await
+}
 
 #[tauri::command]
 pub async fn get_settings(
     app: tauri::AppHandle,
     state: St<'_>,
 ) -> Result<serde_json::Value, String> {
-    let mut map: serde_json::Map<String, serde_json::Value> = state
-        .db
-        .all_settings()
-        .into_iter()
-        .filter(|(k, _)| UI_SETTINGS.contains(&k.as_str()))
-        .map(|(k, v)| (k, serde_json::Value::String(v)))
-        .collect();
+    // The UI-visible subset is computed in the core so the daemon serves the exact same shape.
+    let mut snapshot = state.settings_snapshot();
 
     // The OS is authoritative for autostart. Reconcile the persisted UI value whenever Settings
     // reads it so a deleted/failed desktop registration can never leave a misleading ON switch.
     use tauri_plugin_autostart::ManagerExt;
-    if let Ok(enabled) = app.autolaunch().is_enabled() {
+    if let (Ok(enabled), Some(map)) = (app.autolaunch().is_enabled(), snapshot.as_object_mut()) {
         let value = if enabled { "true" } else { "false" };
         state.db.set_setting("autostart", value);
         map.insert("autostart".into(), serde_json::Value::String(value.into()));
     }
-    Ok(serde_json::Value::Object(map))
+    Ok(snapshot)
 }
 
 /// Resolve the same live Material-role chain used by Ryoku.Ui.Singletons.Tokens.
@@ -465,7 +425,27 @@ pub async fn set_setting(
     if key == "lyrics_boidu" {
         state.db.clear_lyrics_cache();
     }
+    // Romanization is added on the way out of get_lyrics, so open lyrics views refetch (from the
+    // cache) to show or drop the reading without waiting for the next track.
+    if key == "lyrics_romanize" {
+        state.emit("lyrics-changed", serde_json::json!({}));
+    }
     Ok(())
+}
+
+/// The personal store (Home Shortcuts, sidebar pins, play recency, Home arrangement). Wrapped in
+/// `{ personal }` so a client tells "nothing saved yet" (`{}`) apart from a transport failure. The
+/// blob's shape and reducers live in the clients; the backend only persists it.
+#[tauri::command]
+pub async fn get_personal(state: St<'_>) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({ "personal": state.personal() }))
+}
+
+/// Replace the personal store and emit `personal-changed` to every window (so the mini follows the
+/// main), rejecting a non-object or an oversized blob inside `AppState::set_personal`.
+#[tauri::command]
+pub async fn set_personal(state: St<'_>, personal: serde_json::Value) -> Result<(), String> {
+    state.set_personal(personal)
 }
 
 /// The streamable client keys the orchestrator tries, for the "disabled clients" setting. Names
@@ -482,11 +462,16 @@ pub async fn get_stream_clients() -> Result<Vec<String>, String> {
     Ok(v)
 }
 
-/// Wipe both cache tiers: resolved stream URLs and mpv's on-disk audio cache.
+/// Force-clear every resolution cache (URLs, audio bytes, PoToken, WEB_REMIX blacklist) and,
+/// unless `rotate` is false, re-bootstrap the YouTube visitorData — the manual repair for
+/// "YouTube rejected the stream link".
 #[tauri::command]
-pub async fn clear_caches(state: St<'_>) -> Result<(), String> {
-    state.clear_caches();
-    Ok(())
+pub async fn clear_caches(
+    state: St<'_>,
+    rotate: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let refreshed = state.clear_caches(rotate.unwrap_or(true)).await;
+    Ok(serde_json::json!({ "visitorDataRefreshed": refreshed }))
 }
 
 // --- auth (authentication flow) ---------------------------------------------------------------------
@@ -520,9 +505,7 @@ pub async fn sign_out(state: St<'_>) -> Result<(), String> {
 /// hears back via `auth-changed` (success) or `login-error`.
 #[tauri::command]
 pub async fn login_webview(state: St<'_>) -> Result<(), String> {
-    let state = state.inner().clone();
-    let app = state.app.clone();
-    crate::session::open_login(app, state);
+    state.inner().sign_in().await;
     Ok(())
 }
 
@@ -576,14 +559,12 @@ fn metadata_client(state: &Arc<AppState>) -> Result<&innertube::YouTubeClient, S
 
 #[tauri::command]
 pub async fn get_home(state: St<'_>, params: Option<String>) -> Result<HomePage, String> {
-    let client = metadata_client(&state)?;
-    state.it.home(client, params.as_deref()).await.map_err(|e| e.to_string())
+    state.home(params.as_deref()).await
 }
 
 #[tauri::command]
 pub async fn get_home_more(state: St<'_>, token: String) -> Result<HomePage, String> {
-    let client = metadata_client(&state)?;
-    state.it.home_continuation(client, &token).await.map_err(|e| e.to_string())
+    state.home_more(&token).await
 }
 
 #[tauri::command]
@@ -655,20 +636,12 @@ pub async fn get_library(state: St<'_>) -> Result<Vec<BrowseItem>, String> {
 /// these grids, so "nothing of yours on YouTube" is an answer, not a failure.
 #[tauri::command]
 pub async fn get_library_albums(state: St<'_>) -> Result<Vec<BrowseItem>, String> {
-    if !state.it.is_logged_in() {
-        return Ok(Vec::new());
-    }
-    let client = metadata_client(&state)?;
-    state.it.library_albums(client).await.map_err(|e| e.to_string())
+    state.library_albums().await
 }
 
 #[tauri::command]
 pub async fn get_library_artists(state: St<'_>) -> Result<Vec<BrowseItem>, String> {
-    if !state.it.is_logged_in() {
-        return Ok(Vec::new());
-    }
-    let client = metadata_client(&state)?;
-    state.it.library_artists(client).await.map_err(|e| e.to_string())
+    state.library_artists().await
 }
 
 /// A playlist or album page. `id` is the browseId (`VL…` / `MPRE…`); Liked Songs is `VLLM`, and
@@ -954,31 +927,19 @@ pub async fn get_playlist_more(
     state: St<'_>,
     token: String,
 ) -> Result<PlaylistContinuation, String> {
-    let client = metadata_client(&state)?;
-    state.it.playlist_continuation(client, &token).await.map_err(|e| e.to_string())
+    state.playlist_more(&token).await
 }
 
 /// An album page. `id` is the album browseId (`MPRE…`).
 #[tauri::command]
 pub async fn get_album(state: St<'_>, id: String) -> Result<AlbumPage, String> {
-    // A local album is built from SQLite, so it opens the same page while offline (local.rs).
-    if let Some(key) = id.strip_prefix(crate::local::ALBUM_PREFIX) {
-        return Ok(crate::local::album_page(&state.db, key));
-    }
-    // A local artist rides this route too: same page shape, and none of the artist route's
-    // YouTube furniture applies to files on disk (see `local::artist_page`).
-    if let Some(name) = id.strip_prefix(crate::local::ARTIST_PREFIX) {
-        return Ok(crate::local::artist_page(&state.db, name));
-    }
-    let client = metadata_client(&state)?;
-    state.it.album(client, &id).await.map_err(|e| e.to_string())
+    state.album(&id).await
 }
 
 /// An artist page. `id` is the channel browseId (`UC…`).
 #[tauri::command]
 pub async fn get_artist(state: St<'_>, id: String) -> Result<ArtistPage, String> {
-    let client = metadata_client(&state)?;
-    state.it.artist(client, &id).await.map_err(|e| e.to_string())
+    state.artist(&id).await
 }
 
 /// A card grid reached from a carousel's "More" button (e.g. an artist's full albums list).
@@ -988,8 +949,7 @@ pub async fn get_browse_grid(
     id: String,
     params: Option<String>,
 ) -> Result<Vec<BrowseItem>, String> {
-    let client = metadata_client(&state)?;
-    state.it.browse_grid(client, &id, params.as_deref()).await.map_err(|e| e.to_string())
+    state.browse_grid(&id, params.as_deref()).await
 }
 
 /// Play a playlist/album: the given items become the queue (no radio). `start` is the clicked
@@ -1014,9 +974,7 @@ pub async fn play_playlist(
     // id as radio_seed would make queue exhaustion try a YouTube /next request with that id.
     let source_id = source_id.filter(|id| !is_local_playlist_id(id));
     let state = state.inner().clone();
-    state
-        .play_tracks(items, start, source_id, source_name, shuffle.unwrap_or(false), continuation)
-        .await;
+    state.play_tracks(items, start, source_id, source_name, shuffle, continuation).await;
     Ok(())
 }
 
@@ -1500,7 +1458,7 @@ pub async fn set_playlist_cover(
             Err(e) => {
                 tracing::warn!(playlist_id, error = %e, "custom cover not cleared on YouTube Music");
                 if state.db.get_setting(&synced_key(&playlist_id)).is_some() {
-                    let _ = state.app.emit(
+                    state.emit(
                         "cover-error",
                         serde_json::json!({
                             "message": "Removed here, but YouTube Music kept its copy.",
@@ -1547,7 +1505,7 @@ pub async fn set_playlist_cover(
         return Err("That file is not a valid JPEG or PNG image.".into());
     }
 
-    let dir = crate::local::covers_dir(&app).join("playlists");
+    let dir = crate::local::covers_dir(&state.paths).join("playlists");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let stem: String = playlist_id
         .chars()
@@ -1610,7 +1568,7 @@ fn sync_cover(state: &Arc<AppState>, playlist_id: &str, path: String) {
                     innertube::Error::CoverRefused => format!("Artwork saved on this device. {e}"),
                     e => format!("Artwork saved here, but the upload to YouTube Music failed: {e}"),
                 };
-                let _ = state.app.emit("cover-error", serde_json::json!({ "message": message }));
+                state.emit("cover-error", serde_json::json!({ "message": message }));
             }
         }
     });
@@ -1679,8 +1637,11 @@ pub async fn subscribe(state: St<'_>, channel_id: String, subscribed: bool) -> R
 /// `removed` list is every id that was on screen but is gone from disk, so the UI can drop those
 /// tiles without waiting for anyone to click a dead one.
 #[tauri::command]
-pub async fn get_local_library(state: St<'_>) -> Result<crate::local::LocalLibrary, String> {
-    scan_local(&state).await
+pub async fn get_local_library(
+    app: tauri::AppHandle,
+    state: St<'_>,
+) -> Result<crate::local::LocalLibrary, String> {
+    scan_local(&app, &state).await
 }
 
 #[tauri::command]
@@ -1697,28 +1658,31 @@ pub async fn add_local_folder(
         .map_err(|_| "That folder is not a local filesystem path.".to_string())?;
     let path = canonical_music_folder(chosen.to_string_lossy().as_ref())?;
     crate::local::add_folder(&state.db, path);
-    scan_local(&state).await.map(Some)
+    scan_local(&app, &state).await.map(Some)
 }
 
 #[tauri::command]
 pub async fn remove_local_folder(
+    app: tauri::AppHandle,
     state: St<'_>,
     path: String,
 ) -> Result<crate::local::LocalLibrary, String> {
     crate::local::remove_folder(&state.db, &path);
-    scan_local(&state).await
+    scan_local(&app, &state).await
 }
 
 /// Disk IO + tag parsing off the async runtime's worker threads.
-async fn scan_local(state: &Arc<AppState>) -> Result<crate::local::LocalLibrary, String> {
-    let app = state.app.clone();
+async fn scan_local(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+) -> Result<crate::local::LocalLibrary, String> {
+    let covers = crate::local::covers_dir(&state.paths);
     let state = state.clone();
-    let covers = crate::local::covers_dir(&state.app);
     let lib = tauri::async_runtime::spawn_blocking(move || crate::local::scan(&state.db, &covers))
         .await
         .map_err(|e| e.to_string())?;
     // Artwork reaches the page over the asset protocol, which starts out allowing nothing.
-    crate::local::allow_covers(&app, &lib.songs);
+    crate::local_scope::allow_covers(app, &lib.songs);
     Ok(lib)
 }
 
@@ -1828,11 +1792,12 @@ pub async fn get_lyrics(
     if crate::radio::is_radio_id(&video_id) {
         return Ok(None);
     }
-    Ok(crate::lyrics::get_lyrics(
+    let lyrics = crate::lyrics::get_lyrics(
         state.inner(),
         crate::lyrics::LyricsRequest { video_id, title, artists, album, duration },
     )
-    .await)
+    .await;
+    Ok(ryotunes_core::romanize::for_client(state.inner(), lyrics))
 }
 
 /// Open a link from the UI in the real browser. An `<a href>` inside the webview would navigate

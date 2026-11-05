@@ -1,23 +1,12 @@
 //! Ryotunes Tauri app. Wires transport + player + db + orchestrator behind the command boundary.
 
-mod cipher;
 mod commands;
-mod db;
-mod discord;
-mod http;
-mod lastfm;
-mod listentogether;
-mod local;
-mod lyrics;
+mod host_sink;
+mod local_scope;
+mod login_webview;
 mod main_window;
-mod media;
 mod mini;
-mod orchestrator;
-mod potoken;
-mod radio;
 mod ryoku_theme;
-mod session;
-mod state;
 #[cfg(target_os = "windows")]
 mod taskbar;
 mod tray;
@@ -28,6 +17,10 @@ use std::time::Duration;
 
 use innertube::{Clients, InnerTube, Locale, Session};
 use player::{Player, PlayerEvent};
+use ryotunes_core::{
+    cipher, db, discord, lastfm, listentogether, local, lyrics, media, orchestrator, potoken,
+    radio, state,
+};
 use tauri::{Emitter, Manager};
 
 use cipher::{CipherDeobfuscator, PlayerConfigStore};
@@ -103,6 +96,7 @@ fn tune_webview(win: &tauri::WebviewWindow) {
             settings.set_enable_webrtc(false);
             settings.set_enable_webgl(false);
             settings.set_enable_html5_database(false); // WebSQL. localStorage is a separate switch.
+            webkit_features::apply_from_env(&settings);
         }
     });
     match res {
@@ -110,6 +104,87 @@ fn tune_webview(win: &tauri::WebviewWindow) {
             tracing::info!(label, "webkit: audio-only, minimal document cache, media + page cache + webgl off; default UI compositor")
         }
         Err(e) => tracing::warn!(label, error = %e, "webkit tuning failed (continuing)"),
+    }
+}
+
+/// `RYOTUNES_WEBKIT_FEATURES=Name=1,Other=0` flips WebKitGTK feature flags on the app's webviews
+/// (the 2.42 feature API, which the `webkit2gtk` crate does not bind yet). A developer knob for
+/// profiling the renderer: `CompositingBordersVisible=1,CompositingRepaintCountersVisible=1` draws
+/// layer borders and per-layer repaint counters, which is how to see what a scroll repaints.
+/// Unknown names are logged and skipped; the variable is normally unset.
+#[cfg(target_os = "linux")]
+mod webkit_features {
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+
+    use webkit2gtk::glib::translate::ToGlibPtr;
+
+    #[repr(C)]
+    pub struct WebKitFeatureList {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
+    pub struct WebKitFeature {
+        _private: [u8; 0],
+    }
+    extern "C" {
+        fn webkit_settings_get_all_features() -> *mut WebKitFeatureList;
+        fn webkit_feature_list_get_length(list: *mut WebKitFeatureList) -> usize;
+        fn webkit_feature_list_get(
+            list: *mut WebKitFeatureList,
+            index: usize,
+        ) -> *mut WebKitFeature;
+        fn webkit_feature_list_unref(list: *mut WebKitFeatureList);
+        fn webkit_feature_get_identifier(feature: *mut WebKitFeature) -> *const c_char;
+        fn webkit_settings_set_feature_enabled(
+            settings: *mut webkit2gtk::ffi::WebKitSettings,
+            feature: *mut WebKitFeature,
+            enabled: webkit2gtk::glib::ffi::gboolean,
+        );
+    }
+
+    pub fn apply_from_env(settings: &webkit2gtk::Settings) {
+        let Ok(spec) = std::env::var("RYOTUNES_WEBKIT_FEATURES") else { return };
+        let wanted: Vec<(&str, bool)> = spec
+            .split(',')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.trim(), matches!(v.trim(), "1" | "true" | "on")))
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        // Safe: the list is owned for the duration of the loop and unref'd once; every pointer
+        // handed out by `webkit_feature_list_get` is borrowed from it. `settings` outlives the call.
+        unsafe {
+            let list = webkit_settings_get_all_features();
+            let len = webkit_feature_list_get_length(list);
+            let mut applied = Vec::new();
+            for i in 0..len {
+                let feature = webkit_feature_list_get(list, i);
+                let id = CStr::from_ptr(webkit_feature_get_identifier(feature)).to_string_lossy();
+                if let Some((_, on)) = wanted.iter().find(|(k, _)| *k == id) {
+                    webkit_settings_set_feature_enabled(
+                        settings.to_glib_none().0,
+                        feature,
+                        (*on).into(),
+                    );
+                    applied.push(format!("{id}={}", *on as u8));
+                }
+            }
+            webkit_feature_list_unref(list);
+            for (k, _) in &wanted {
+                if !applied.iter().any(|a| a.starts_with(&format!("{k}="))) {
+                    tracing::warn!(
+                        feature = *k,
+                        "RYOTUNES_WEBKIT_FEATURES: unknown WebKit feature"
+                    );
+                }
+            }
+            tracing::info!(
+                features = applied.join(","),
+                "webkit: feature flags from RYOTUNES_WEBKIT_FEATURES"
+            );
+        }
     }
 }
 
@@ -247,7 +322,8 @@ pub fn run() {
                 tracing::info!("loaded persisted login session");
             }
 
-            let session = Session { locale: Locale::default(), visitor_data, data_sync_id, cookie };
+            let session =
+                Session { locale: Locale::from_env(), visitor_data, data_sync_id, cookie };
             let it = match InnerTube::new(session.clone(), proxy.as_deref()) {
                 Ok(it) => it,
                 Err(error) => {
@@ -266,8 +342,10 @@ pub fn run() {
 
             // Cipher and PoToken helpers run in hidden webviews behind the orchestrator.
             let config = Arc::new(PlayerConfigStore::new(&data_dir));
-            let cipher = Arc::new(CipherDeobfuscator::new(handle.clone(), &data_dir, config));
-            let potoken = Arc::new(PoTokenGenerator::new(handle.clone(), db.clone()));
+            let js: Arc<dyn ryotunes_core::host::JsBridge> =
+                Arc::new(webview::TauriJs { app: handle.clone() });
+            let cipher = Arc::new(CipherDeobfuscator::new(js.clone(), &data_dir, config));
+            let potoken = Arc::new(PoTokenGenerator::new(js.clone(), db.clone()));
             let orchestrator = Arc::new(Orchestrator::new(
                 it.clone(),
                 clients.clone(),
@@ -275,9 +353,14 @@ pub fn run() {
                 potoken.clone(),
             ));
 
-            // OS media controls (MPRIS/SMTC/NowPlaying). Its callback resolves AppState lazily, so
-            // it's fine to spawn before AppState is managed. fail-soft policy, D11.
-            let media = media::spawn(handle.clone());
+            // Push channel to every UI window: core emits through this sink, the host fans out.
+            let sink: Arc<dyn ryotunes_core::host::EventSink> =
+                Arc::new(host_sink::TauriSink(handle.clone()));
+
+            // OS media controls (MPRIS/SMTC/NowPlaying). Control presses arrive over `media_rx`;
+            // the drain below routes them into AppState once it is managed. fail-soft policy, D11.
+            let (media_tx, mut media_rx) = tokio::sync::mpsc::unbounded_channel();
+            let media = media::spawn(sink.clone(), media_tx);
             // Taskbar preview buttons (#47). Windows-only, and a different API from the SMTC
             // session above.
             #[cfg(target_os = "windows")]
@@ -292,8 +375,12 @@ pub fn run() {
             );
 
             // Last.fm scrobbler — parks until a session key exists (titlebar connect flow).
-            let lastfm =
-                lastfm::spawn(db.get_setting("lastfm_session_key").filter(|s| !s.is_empty()));
+            // `setup` runs on the main thread, outside any Tokio context, so hand the core
+            // Tauri's runtime handle instead of relying on the ambient one.
+            let lastfm = lastfm::spawn(
+                tauri::async_runtime::handle().inner(),
+                db.get_setting("lastfm_session_key").filter(|s| !s.is_empty()),
+            );
 
             // Listen Together session (session protocol). Server URL is a DB setting so "home PC → VPS" is
             // config, not a rebuild. The sync channel feeds the guest-playback bridge below.
@@ -302,31 +389,54 @@ pub fn run() {
             // user chooses one.
             let lt_url =
                 db.get_setting("lt_server_url").filter(|u| !u.is_empty()).unwrap_or_default();
-            let (lt, lt_sync_rx) = listentogether::LtSession::new(handle.clone(), lt_url);
+            let (lt, lt_sync_rx) = listentogether::LtSession::new(sink.clone(), lt_url);
+
+            // Where the core keeps its files (covers, db, mpv audio cache). The host owns the
+            // XDG resolution; the core only ever joins onto these.
+            let paths = ryotunes_core::host::Paths {
+                data_dir: data_dir.clone(),
+                cache_dir: cache_dir.clone(),
+            };
+            // Interactive Google sign-in lives in the host — it needs a visible browser window.
+            let login: Arc<dyn ryotunes_core::host::LoginFlow> =
+                Arc::new(login_webview::TauriLogin { app: handle.clone() });
 
             let app_state = Arc::new(AppState::new(
                 it,
                 clients,
                 player,
                 db,
-                handle.clone(),
+                sink.clone(),
+                login,
+                paths,
                 orchestrator,
                 lt,
-                cache_dir.clone(),
                 media,
                 discord,
                 lastfm,
             ));
             app.manage(app_state.clone());
 
+            // OS media control presses (media keys, MPRIS, Windows taskbar) come off `media_rx`;
+            // apply them to the now-managed AppState on the Tauri runtime.
+            {
+                let st = app_state.clone();
+                let media_app = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    while let Some(ev) = media_rx.recv().await {
+                        handle_media_event(st.clone(), media_app.clone(), ev).await;
+                    }
+                });
+            }
+
             // Ryoku's own QML apps watch the live palette files. Mirror that with one blocking
             // inotify watcher rather than a JavaScript polling clock so named themes and wallpaper
             // palettes reach Ryotunes immediately while idle CPU stays asleep.
-            ryoku_theme::spawn_watcher(handle.clone());
+            ryoku_theme::spawn_watcher(sink.clone());
 
             // Local music artwork reaches the webview over the asset protocol, whose configured
             // scope is empty — the folders it may read are the ones the user picked (local.rs).
-            local::allow_music_paths(&handle, &app_state.db);
+            local_scope::allow_music_paths(&handle, &app_state.db, &app_state.paths);
 
             // System tray: playback controls + show/quit while running in the background.
             if let Err(e) = tray::init(&handle) {
@@ -392,16 +502,22 @@ pub fn run() {
                     }
                 });
             }
-            // Hidden authentication JS is burst work, not resident UI. Tear helpers down quickly
-            // after real work and keep only their Rust-side analysis/session state.
+            // The hidden cipher/PoToken webviews are burst workers, but every track start needs
+            // them: tearing them down 15 s after use meant a fresh WebKit process, a 3 MB JS
+            // injection and a full analysis per track. Keep them resident while media is
+            // loaded and only release them after a long idle with nothing playing.
             {
                 let cipher = cipher.clone();
                 let potoken = potoken.clone();
+                let st = app_state.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                        cipher.teardown_if_idle(Duration::from_secs(15)).await;
-                        potoken.teardown_if_idle(Duration::from_secs(15)).await;
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        if st.player.has_loaded_media() {
+                            continue;
+                        }
+                        cipher.teardown_if_idle(Duration::from_secs(300)).await;
+                        potoken.teardown_if_idle(Duration::from_secs(300)).await;
                     }
                 });
             }
@@ -414,10 +530,12 @@ pub fn run() {
                 main_window::enforce_floating_geometry(app.handle());
                 main_window::request_hyprland_float(app.handle());
                 // The main WebView starts hidden to avoid exposing an unpainted WebKit frame.
-                // Svelte normally reveals it immediately from `onMount`; this bounded native
-                // fallback guarantees that a lost readiness message can never leave a normal
-                // cold launch permanently tray-only.
-                main_window::arm_reveal_failsafe(app.handle(), Duration::from_millis(1500));
+                // Svelte normally reveals it from `onMount`; this bounded native fallback only
+                // guarantees that a lost readiness message can never leave a cold launch
+                // permanently tray-only. A cold WebKitGTK + SvelteKit mount takes 1-3 s on a
+                // laptop, so the fallback sits well past that or it fires before the handshake
+                // and shows an unstyled frame.
+                main_window::arm_reveal_failsafe(app.handle(), Duration::from_millis(4000));
                 spawn_heap_trimmer();
             }
             Ok(())
@@ -452,9 +570,13 @@ pub fn run() {
             commands::get_playback,
             commands::frontend_ready,
             commands::get_settings,
+            commands::check_for_updates,
+            commands::install_update,
             commands::discord_status,
             commands::ryoku_theme_tokens,
             commands::set_setting,
+            commands::get_personal,
+            commands::set_personal,
             commands::get_stream_clients,
             commands::clear_caches,
             commands::get_account,
@@ -598,6 +720,60 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+/// Route an OS media-control press into the same [`AppState`] methods the UI commands use. The
+/// media-controls thread (and, on Windows, the taskbar toolbar) feed presses here over `media_rx`.
+async fn handle_media_event(
+    state: Arc<AppState>,
+    app: tauri::AppHandle,
+    event: souvlaki::MediaControlEvent,
+) {
+    use souvlaki::{MediaControlEvent, MediaPosition, SeekDirection};
+    match event {
+        MediaControlEvent::Play => state.resume().await,
+        MediaControlEvent::Toggle => state.resume_or_toggle().await,
+        MediaControlEvent::Pause => {
+            let _ = state.player.pause();
+        }
+        MediaControlEvent::Stop => {
+            let _ = state.player.stop();
+            state.media_set_playing(false);
+            main_window::schedule_idle_exit(&app);
+        }
+        MediaControlEvent::Next => state.next_in_queue().await,
+        MediaControlEvent::Previous => state.prev_in_queue().await,
+        MediaControlEvent::SetPosition(MediaPosition(pos)) => {
+            let _ = state.player.seek(pos.as_secs_f64());
+        }
+        MediaControlEvent::SeekBy(dir, by) => {
+            let delta = if matches!(dir, SeekDirection::Forward) {
+                by.as_secs_f64()
+            } else {
+                -by.as_secs_f64()
+            };
+            let _ = state.player.seek((state.current_position() + delta).max(0.0));
+        }
+        MediaControlEvent::Seek(dir) => {
+            let delta = if matches!(dir, SeekDirection::Forward) { 10.0 } else { -10.0 };
+            let _ = state.player.seek((state.current_position() + delta).max(0.0));
+        }
+        _ => {}
+    }
+}
+
+/// The Windows taskbar toolbar holds only an `AppHandle`; resolve the managed state and route its
+/// press through [`handle_media_event`], matching the old `media::handle_event` fire-and-forget.
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_media_event_from_app(
+    app: &tauri::AppHandle,
+    event: souvlaki::MediaControlEvent,
+) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = app.try_state::<Arc<AppState>>() else { return };
+        handle_media_event(state.inner().clone(), app.clone(), event).await;
+    });
 }
 
 /// ✕ hides to tray unless the user explicitly set close_to_tray=false (unset → default on).

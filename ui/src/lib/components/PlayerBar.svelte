@@ -24,6 +24,7 @@
 	import { fade } from 'svelte/transition';
 	import { Button } from '$lib/components/ui/button';
 	import * as api from '$lib/api';
+	import { seekReleaseGuard } from '$lib/seek-drag';
 	import {
 		np,
 		playback,
@@ -41,6 +42,7 @@
 	import ArtistLine from './ArtistLine.svelte';
 	import Marquee from './Marquee.svelte';
 	import TrackMenu from './TrackMenu.svelte';
+	import { t } from '$lib/i18n.svelte';
 
 	let {
 		onToggleQueue,
@@ -98,20 +100,29 @@
 	});
 
 	// Seek: while dragging, hold a local value so incoming mpv position ticks can't yank the thumb
-	// back under the pointer; only invoke the (expensive) seek on release.
+	// back under the pointer; only invoke the (expensive) seek on release. `seekReleaseGuard`
+	// commits the drag for a release WebKit never delivers (see $lib/seek-drag).
 	let seekDrag = $state<number | null>(null);
+	let seekInput: HTMLInputElement | undefined = $state();
 	const shownPosition = $derived(seekDrag ?? playback.position);
 	const seekPct = $derived(playback.duration > 0 ? Math.min(100, Math.max(0, (shownPosition / playback.duration) * 100)) : 0);
+	// A track change ends any drag: the value belonged to the previous track.
+	$effect(() => {
+		void playback.now?.videoId;
+		seekDrag = null;
+	});
 	const SEEK_WAVE = 'M 0 5 Q 1.250 1 2.500 5 Q 3.750 9 5.000 5 Q 6.250 1 7.500 5 Q 8.750 9 10.000 5 Q 11.250 1 12.500 5 Q 13.750 9 15.000 5 Q 16.250 1 17.500 5 Q 18.750 9 20.000 5 Q 21.250 1 22.500 5 Q 23.750 9 25.000 5 Q 26.250 1 27.500 5 Q 28.750 9 30.000 5 Q 31.250 1 32.500 5 Q 33.750 9 35.000 5 Q 36.250 1 37.500 5 Q 38.750 9 40.000 5 Q 41.250 1 42.500 5 Q 43.750 9 45.000 5 Q 46.250 1 47.500 5 Q 48.750 9 50.000 5 Q 51.250 1 52.500 5 Q 53.750 9 55.000 5 Q 56.250 1 57.500 5 Q 58.750 9 60.000 5 Q 61.250 1 62.500 5 Q 63.750 9 65.000 5 Q 66.250 1 67.500 5 Q 68.750 9 70.000 5 Q 71.250 1 72.500 5 Q 73.750 9 75.000 5 Q 76.250 1 77.500 5 Q 78.750 9 80.000 5 Q 81.250 1 82.500 5 Q 83.750 9 85.000 5 Q 86.250 1 87.500 5 Q 88.750 9 90.000 5 Q 91.250 1 92.500 5 Q 93.750 9 95.000 5 Q 96.250 1 97.500 5 Q 98.750 9 100.000 5';
 
 	function onSeekInput(e: Event) {
 		seekDrag = Number((e.target as HTMLInputElement).value);
 	}
-	function onSeekCommit(e: Event) {
-		const v = Number((e.target as HTMLInputElement).value);
+	function commitSeek(v: number) {
 		setPlaybackPosition(v);
 		seekDrag = null;
 		api.seek(v);
+	}
+	function onSeekCommit(e: Event) {
+		commitSeek(Number((e.target as HTMLInputElement).value));
 	}
 
 	const onVolume = (e: Event) => dragVolume(Number((e.target as HTMLInputElement).value));
@@ -164,16 +175,16 @@
 		<div class="min-w-0">
 			<div class="flex items-center gap-1.5">
 				<Marquee
-					text={playback.now?.title ?? 'Nothing playing'}
+					text={playback.now?.title ?? t('Nothing playing')}
 					class="text-sm font-medium"
 				/>
 				{#if playback.pendingVideoId}
-					<span class="ryo-player-resolving" title="Resolving stream"><HugeiconsIcon icon={Loading03Icon} class="h-3 w-3 animate-spin" /> RESOLVING</span>
+					<span class="ryo-player-resolving" title={t('Resolving stream')}><HugeiconsIcon icon={Loading03Icon} class="h-3 w-3 animate-spin" /> {t('RESOLVING')}</span>
 				{/if}
 				{#if autoplayTrack}
 					<span
 						class="shrink-0 text-muted-foreground"
-						title="Playing similar music (Autoplay)"
+						title={t('Playing similar music (Autoplay)')}
 						in:fade={{ duration: 170 }}
 					>
 						<HugeiconsIcon icon={InfinityIcon} class="h-3.5 w-3.5" />
@@ -196,7 +207,7 @@
 						size="icon-sm"
 						class="hidden lg:inline-flex"
 						onclick={toggleLike}
-						aria-label="Like"
+						aria-label={t('Like')}
 					>
 						<span
 							class="inline-flex"
@@ -224,7 +235,7 @@
 								duration: now.duration
 							});
 						}}
-						aria-label="Add to playlist"
+						aria-label={t('Add to playlist')}
 					>
 						<HugeiconsIcon icon={Add01Icon} class="h-4 w-4 text-muted-foreground" />
 					</Button>
@@ -248,7 +259,7 @@
 				variant="ghost"
 				size="icon-sm"
 				onclick={() => api.toggleShuffle()}
-				aria-label="Shuffle"
+				aria-label={t('Shuffle')}
 				aria-pressed={shuffleOn}
 			>
 				<HugeiconsIcon
@@ -256,7 +267,7 @@
 					class="h-4 w-4 {shuffleOn ? 'text-primary' : 'text-muted-foreground'}"
 				/>
 			</Button>
-			<Button variant="ghost" size="icon-sm" onclick={() => api.prevTrack()} aria-label="Previous">
+			<Button variant="ghost" size="icon-sm" onclick={() => api.prevTrack()} aria-label={t('Previous')}>
 				<HugeiconsIcon icon={PreviousIcon} class="h-5 w-5" />
 			</Button>
 			<Button
@@ -264,7 +275,7 @@
 				size="icon"
 				class="ryo-transport-primary rounded-md"
 				onclick={() => api.togglePause()}
-				aria-label="Play/pause"
+				aria-label={t('Play/pause')}
 			>
 				
 			<HugeiconsIcon
@@ -274,14 +285,14 @@
 				class="h-5 w-5"
 			/>
 			</Button>
-			<Button variant="ghost" size="icon-sm" onclick={() => api.nextTrack()} aria-label="Next">
+			<Button variant="ghost" size="icon-sm" onclick={() => api.nextTrack()} aria-label={t('Next')}>
 				<HugeiconsIcon icon={NextIcon} class="h-5 w-5" />
 			</Button>
 			<Button
 				variant="ghost"
 				size="icon-sm"
 				onclick={cycleRepeat}
-				aria-label="Repeat: {repeat}"
+				aria-label={`${t('Repeat')}: ${repeat}`}
 				aria-pressed={repeat !== 'off'}
 			>
 				
@@ -306,9 +317,11 @@
 					min="0"
 					max={playback.duration || 0}
 					value={shownPosition}
+					bind:this={seekInput}
 					oninput={onSeekInput}
 					onchange={onSeekCommit}
-					aria-label="Seek"
+					{@attach seekReleaseGuard(() => seekDrag !== null, () => commitSeek(Number(seekInput?.value ?? seekDrag)))}
+					aria-label={t('Seek')}
 				/>
 			</div>
 			<span class="tabular-nums">{fmt(playback.duration)}</span>
@@ -324,7 +337,7 @@
 				size="icon-sm"
 				class="text-muted-foreground"
 				onclick={toggleMute}
-				aria-label={playback.volume === 0 ? 'Unmute' : 'Mute'}
+				aria-label={t(playback.volume === 0 ? 'Unmute' : 'Mute')}
 			>
 				
 				<HugeiconsIcon
@@ -344,19 +357,19 @@
 				oninput={onVolume}
 				onchange={onVolumeCommit}
 				onwheel={wheelVolume}
-				aria-label="Volume"
+				aria-label={t('Volume')}
 			/>
 		</div>
 		
 		<div class="flex items-center gap-0.5">
-			<Button variant="ghost" size="icon-sm" onclick={openMiniPlayer} aria-label="Mini player">
+			<Button variant="ghost" size="icon-sm" onclick={openMiniPlayer} aria-label={t('Mini player')}>
 				<HugeiconsIcon icon={MinimizeScreenIcon} class="h-5 w-5" />
 			</Button>
 			<Button
 				variant={lyricsOpen ? 'secondary' : 'ghost'}
 				size="icon-sm"
 				onclick={onToggleLyrics}
-				aria-label={isRadioNow ? 'Lyrics unavailable for live radio' : 'Toggle lyrics'}
+				aria-label={t(isRadioNow ? 'Lyrics unavailable for live radio' : 'Toggle lyrics')}
 				disabled={isRadioNow}
 			>
 				<HugeiconsIcon icon={Mic01Icon} class="h-5 w-5" />
@@ -365,7 +378,7 @@
 				variant={queueOpen ? 'secondary' : 'ghost'}
 				size="icon-sm"
 				onclick={onToggleQueue}
-				aria-label="Toggle queue"
+				aria-label={t('Toggle queue')}
 			>
 				<HugeiconsIcon icon={Queue01Icon} class="h-5 w-5" />
 			</Button>
@@ -374,7 +387,7 @@
 				variant="ghost"
 				size="icon-sm"
 				onclick={() => (np.open = !np.open)}
-				aria-label={np.open ? 'Minimise player' : 'Open player'}
+				aria-label={t(np.open ? 'Minimise player' : 'Open player')}
 				aria-expanded={np.open}
 			>
 				
